@@ -1,5 +1,5 @@
 package Bot::Pluggable::Blogger;
-$VERSION = 0.01;
+$VERSION = 0.02;
 use strict; 
 use warnings;
 use base qw(Bot::Pluggable::Common);
@@ -33,63 +33,71 @@ exit(0);
 
 =head1 DESCRIPTION
          A Wrapper around Net::Blogger to allow posting from IRC to a Blogger
-			 API (for example to a Moveable Type based Blog).
-			 
+             API (for example to a Moveable Type based Blog).
+             
 =cut
 
-use POE;
 use HTML::Entities;
 use Net::Blogger;
+use POE;
 
-sub getBlogger {
+sub BEGIN { print STDERR __PACKAGE__ . " Loaded\n" }
+
+sub blog {
     my ($self) = @_;
-    my $mt = Net::Blogger->new(engine=>"movabletype");
-    $mt->Proxy("$self->{proxy}");
-    $mt->Username("$self->{user}");
-    $mt->Password("$self->{pass}");
-    $mt->BlogId($self->{blog_id});
-    return $mt;		
+    my $mt = Net::Blogger->new(engine=>$self->{type});
+    $mt->Proxy($self->{proxy});
+    $mt->Username($self->{user});
+    $mt->Password($self->{pass});
+    $mt->AppKey($self->{app_key}) if defined $self->{app_key};
+    $mt->BlogId($self->{blog_id} || $mt->GetBlogId(blogname=>$self->{blog_name})) || die "Could Not get Blog";
+    print STDERR "Got Blog\n" if $self->{DEBUG}; 
+    return $mt;     
 }
 
 sub post {
-    my ($self, $message, $nick) = @_;
+    my ($self, $message, $nick, $sender) = @_;
     print STDERR "posting $message to $self->{url} because of $nick\n" if $self->{DEBUG}; 
-    my $mt = $self->getBlogger;
-		 my $title = (join ' ', (split /\s+/, $message)[0..2]).'...';
-    $message = encode_entities($message, '<>&');
-    my $postID = $mt->metaWeblog()->newPost(title=>encode_entities($title), description=>"$nick says:\n\n $message", publish=>1);      
-    return "POSTED: $postID";
+    my $mt = $self->blog;  
+    my $title = (join ' ', (split /\s+/, $message)[0..2]).'...';
+    $message = "$nick says:\n" . encode_entities($message, '<>&');
+    my $postID = $mt->metaWeblog()->newPost(title=>encode_entities($title), description=>$message, publish=>1);
+    return $self->tell($sender, $mt->LastError())  unless $postID;
+    return $self->tell($sender, "POSTED: $postID");
 }
 
 sub update_post {
-		my ($self, $postID, $message, $nick) = @_;
-    my $mt = $self->getBlogger();
-		my $post = $mt->metaWeblog()->getPost(postid=>$postID) or warn $mt->LastError();
-		return "Post not found" unless $post;
-   ($message, $nick) = encode_entities($message, '<>&"'), encode_entities($nick));
-		my $ok = $mt->editPost(postid=>$postID, postbody=>\"$post->{description}\n$nick:\n\n $message", publish=>1);
-		return "UPDATED: $postID" if $ok;
-		return $mt->LastError();
+    my ($self, $postID, $message, $nick, $sender) = @_;
+    my $mt = $self->blog();
+    my $post = $mt->metaWeblog()->getPost(postid=>$postID) or warn $mt->LastError();
+    return $self->tell($sender, "Post not found") unless $post;
+   ($message, $nick) = (encode_entities($message, '<>&"'), encode_entities($nick));
+    my $postbody = "$post->{description}\n\n$nick:\n $message";
+    my $ok = $mt->editPost(postid=>$postID, postbody=>\$postbody, publish=>1);
+    return $self->tell($sender, "UPDATED: $postID") if $ok;
+    return $self->tell($sender, $mt->LastError());
 }
 
 sub title_post {
-    my ($self, $postID, $title) = @_;
-    my $mt = $self->getBlogger();
+    my ($self, $postID, $title, $sender) = @_;
+    my $mt = $self->blog();
     my $post = $mt->metaWeblog()->getPost(postid=>$postID) or warn $mt->LastError();
-    return "Post not found" unless $post;
+    return $self->tell($sender, "Post not found") unless $post;
     my $ok = $mt->metaWeblog()->editPost(postid=>$postID, title=>encode_entities($title), description=>$post->{description}, publish=>1);
-    return "TITLED: $postID" if $ok;
-    return $mt->LastError();
+    return $self->tell($sender, "TITLED: $postID") if $ok;
+    return $self->tell($sender, $mt->LastError());
 }
 
 sub told {
     my ($self, $nick, $channel, $message) = @_;
     my $sender = $channel || $nick;
+    my $SEP_RX = qr{[\:\,\;\.]?};
     for ($message) {
-        /^post[\:\,\;\.]?\s+(.+)$/i && do { $self->tell($sender, $self->post($1, $nick)) };
-        /^update\s+(\d+)[\:\,\;\.]?\s+(.+)$/i && do { $self->tell($sender, $self->update_post($1, $2, $nick)) };
-        /^title\s+(\d+)[\:\,\;\.]?\s+(.+)$/i && do { $self->tell($sender, $self->title_post($1, $2)) };
-        /^url\??$/ && do { $self->tell($sender, "Try: $self->{url}") };
+        /^post\s*$SEP_RX\s+(.+)$/ix && return $self->post($1, $nick, $sender);
+        /^update\s+(\d+)\s*$SEP_RX\s+(.+)$/i && return $self->update_post($1, $2, $nick, $sender);
+        /^(\d+)\s*\.=\s+(.+)$/i && return $self->update_post($1, $2, $nick, $sender);
+        /^title\s+(\d+)\s*$SEP_RX\s+(.+)$/i && return $self->title_post($1, $2, $sender);
+        /^url\??$/ && return $self->tell($sender, "Try: $self->{url}");
     }
 }
 
@@ -97,20 +105,8 @@ sub told {
 # EVENTS
 #
 
-sub irc_public {
-    my ($self, $bot, $nickstring, $channels, $message) = @_[OBJECT, SENDER, ARG0, ARG1, ARG2];  
-    my $nick = $self->nick($nickstring);
-    my $me = $bot->{Nick};
-    $self->told($nick, $channels->[0], $1) if ($message =~ m/^\s*$me[\:\,\;\.]?\s*(.*)$/i);
-		 return 0;
-}
-
-sub irc_msg {
-    my ($self, $bot, $nickstring, $recipients, $message) = @_[OBJECT, SENDER, ARG0, ARG1, ARG2];
-    my $nick = $self->nick($nickstring);
-    $self->told($nick, undef, $message);
-		return 0;
-}
+1;
+__END__
 
 =head1 LIMITATIONS
 
@@ -129,4 +125,3 @@ Chris Prather <chris@prather.org>
 
 =cut
 
-1;
